@@ -1,0 +1,10 @@
+Goal → move away from correct answer  
+       to SPECIFIC target answer
+
+Step 1: Setup folder structure (now)
+Step 2: Modify attacker_targeted.py (core change)
+Step 3: Modify train_targeted.py (add target args)
+Step 4: Modify generator_targeted.py (conditioning)
+Step 5: Modify eval_targeted.py (new metrics)
+Step 6: Train targeted attack
+Step 7: Evaluate and compare
