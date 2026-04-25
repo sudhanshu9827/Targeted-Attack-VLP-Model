@@ -2,16 +2,15 @@ import argparse
 import os
 import torch
 import torch.nn.functional as F
-import numpy as np
-import random
-from torch.utils.data import DataLoader
+import torch.optim as optim
 from torchvision import transforms
 from tqdm import tqdm
 import ruamel.yaml as yaml
+import json
 
+from utils import load_model
 from generator_targeted import Generator
 from dataset import paired_dataset
-from utils import load_model
 
 
 # =========================
@@ -19,19 +18,16 @@ from utils import load_model
 # =========================
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--batch_size', type=int, default=8)
-parser.add_argument('--epochs', type=int, default=40)   # 🔥 increased
-parser.add_argument('--lr', type=float, default=1e-4)
-parser.add_argument('--eps', type=float, default=12)
-parser.add_argument('--alpha', type=float, default=0.01)  # 🔥 reduced
-
+parser.add_argument('--config', default='../configs/Retrieval_flickr_train.yaml')
+parser.add_argument('--checkpoint', default='../checkpoint/ALBEF/flickr30k.pth')
 parser.add_argument('--target_text', required=True)
 
-parser.add_argument('--source_model', default='ALBEF')
-parser.add_argument('--source_text_encoder', default='bert-base-uncased')
-parser.add_argument('--source_ckpt', default='../checkpoint/ALBEF/flickr30k.pth')
+parser.add_argument('--epochs', type=int, default=30)
+parser.add_argument('--batch_size', type=int, default=16)
 
-parser.add_argument('--save_dir', default='../targeted_output')
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--eps', type=float, default=20)
+parser.add_argument('--alpha', type=float, default=0.01)
 
 args = parser.parse_args()
 
@@ -41,34 +37,24 @@ args = parser.parse_args()
 # =========================
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-torch.manual_seed(42)
-np.random.seed(42)
-random.seed(42)
-
-
-# =========================
-# LOAD CONFIG
-# =========================
 _yaml = yaml.YAML()
+config = _yaml.load(open(args.config))
 
-config_path = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "configs",
-    "Retrieval_flickr_train.yaml"
-)
+save_path = "../targeted_output/ALBEF/flickr30k/"
+os.makedirs(save_path, exist_ok=True)
 
-config = _yaml.load(open(config_path))
+eps = args.eps / 255.0
 
 
 # =========================
 # LOAD MODEL
 # =========================
 print("Loading model...")
+
 model, _, tokenizer = load_model(
-    args.source_model,
-    args.source_ckpt,
-    args.source_text_encoder,
+    "ALBEF",
+    args.checkpoint,
+    "bert-base-uncased",
     config,
     device
 )
@@ -82,7 +68,7 @@ model.eval()
 # =========================
 transform = transforms.Compose([
     transforms.Resize((config['image_res'], config['image_res'])),
-    transforms.ToTensor()
+    transforms.ToTensor(),
 ])
 
 normalize = transforms.Normalize(
@@ -92,10 +78,72 @@ normalize = transforms.Normalize(
 
 
 # =========================
+# DATASET
+# =========================
+dataset = paired_dataset(
+    config['annotation_file'],
+    transform,
+    config['image_root']
+)
+
+loader = torch.utils.data.DataLoader(
+    dataset,
+    batch_size=args.batch_size,
+    shuffle=True,
+    num_workers=4,
+    collate_fn=dataset.collate_fn
+)
+
+
+# =========================
+# FIXED TEXT LOADING (IMPORTANT FIX)
+# =========================
+print("Encoding all captions...")
+
+with open(config['annotation_file'], 'r') as f:
+    data = json.load(f)
+
+all_texts = []
+
+for item in data:
+    caps = item['caption']
+    if not isinstance(caps, list):
+        caps = [caps]
+    all_texts.extend(caps)
+
+
+# =========================
+# TEXT ENCODING (BATCHED)
+# =========================
+all_text_feats = []
+
+for i in tqdm(range(0, len(all_texts), 64)):
+    batch = all_texts[i:i+64]
+
+    with torch.no_grad():
+        inp = tokenizer(
+            batch,
+            padding='max_length',
+            truncation=True,
+            max_length=30,
+            return_tensors='pt'
+        ).to(device)
+
+        feat = model.inference_text(inp)['text_feat']
+        feat = F.normalize(feat, dim=-1)
+
+    all_text_feats.append(feat.cpu())
+
+all_text_feats = torch.cat(all_text_feats, dim=0).to(device)
+
+print("Total captions:", len(all_texts))
+
+
+# =========================
 # TARGET TEXT
 # =========================
 with torch.no_grad():
-    text_inputs = tokenizer(
+    target_input = tokenizer(
         [args.target_text],
         padding='max_length',
         truncation=True,
@@ -103,90 +151,59 @@ with torch.no_grad():
         return_tensors='pt'
     ).to(device)
 
-    target_txt_feat = model.inference_text(text_inputs)['text_feat']
-    target_txt_feat = F.normalize(target_txt_feat, dim=-1).detach()
+    target_txt_feat = model.inference_text(target_input)['text_feat']
+    target_txt_feat = F.normalize(target_txt_feat, dim=-1)
 
-print(f"🎯 Target text: {args.target_text}")
+target_sim = (target_txt_feat @ all_text_feats.T).squeeze()
+target_index = target_sim.argmax().item()
 
-
-# =========================
-# DATASET
-# =========================
-train_dataset = paired_dataset(
-    config['annotation_file'],
-    transform,
-    config['image_root']
-)
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=args.batch_size,
-    shuffle=True,
-    num_workers=4,
-    collate_fn=train_dataset.collate_fn,
-    drop_last=True
-)
+print(f"🎯 Target index: {target_index}")
 
 
 # =========================
-# GENERATOR
+# GENERATOR (FIXED STRONG VERSION)
 # =========================
-z_dim = 100
-
 generator = Generator(
-    input_dim=z_dim,
-    num_filters=[[1024], [512], [256], [128]],
+    input_dim=100,
+    num_filters=[[512, 256], [128, 64], [32, 16]],
     output_dim=3,
     batch_size=args.batch_size,
-    first_kernel_size=4
+    first_kernel_size=4,
+    context_dim=target_txt_feat.shape[-1]
 ).to(device)
 
-optimizer = torch.optim.Adam(generator.parameters(), lr=args.lr)
-
-eps = args.eps / 255.0
+optimizer = optim.Adam(generator.parameters(), lr=args.lr)
 
 
 # =========================
-# UNIVERSAL NOISE
+# FIXED LATENT VECTOR
 # =========================
-z = torch.randn(1, z_dim, 1, 1).to(device)
+z = torch.randn(1, 100, 3, 3).to(device)
 
 
 # =========================
-# SAVE DIR
+# TRAINING
 # =========================
-save_path = os.path.join(
-    args.save_dir,
-    args.source_model,
-    "flickr30k"
-)
-os.makedirs(save_path, exist_ok=True)
-
 best_loss = float('inf')
 
-
-# =========================
-# TRAINING LOOP
-# =========================
 print("\n🚀 Starting Training...\n")
 
 for epoch in range(args.epochs):
 
     total_loss = 0
 
-    for images, _, _, _ in tqdm(train_loader):
+    for images, _, _, _ in tqdm(loader):
 
         images = images.to(device)
+        B = images.size(0)
 
-        # -----------------------
-        # NOISE + TARGET
-        # -----------------------
-        z_batch = z.repeat(images.size(0), 1, 1, 1)
-        target_batch = target_txt_feat.expand(images.size(0), -1)
+        # 🔥 add small noise (improves robustness)
+        images = images + 0.01 * torch.randn_like(images)
+        images = torch.clamp(images, 0, 1)
 
-        # -----------------------
-        # GENERATE PERTURBATION
-        # -----------------------
+        z_batch = z.repeat(B, 1, 1, 1)
+        target_batch = target_txt_feat.expand(B, -1)
+
         delta = generator(z_batch, target_batch)
 
         delta = F.interpolate(
@@ -201,61 +218,68 @@ for epoch in range(args.epochs):
 
         adv_images = torch.clamp(images + delta, 0, 1)
 
-        # -----------------------
+        # =========================
         # FEATURES
-        # -----------------------
+        # =========================
+        adv_feat = model.inference_image(
+            normalize(adv_images)
+        )['image_feat']
+
+        adv_feat = F.normalize(adv_feat, dim=-1)
+
         with torch.no_grad():
             clean_feat = model.inference_image(
                 normalize(images)
             )['image_feat']
             clean_feat = F.normalize(clean_feat, dim=-1)
 
-        adv_feat = model.inference_image(
-            normalize(adv_images)
-        )['image_feat']
-        adv_feat = F.normalize(adv_feat, dim=-1)
+        # =========================
+        # LOSS
+        # =========================
+        logits = adv_feat @ all_text_feats.T / 0.07
 
-        # -----------------------
-        # SIMILARITY
-        # -----------------------
-        sim_target = torch.sum(adv_feat * target_batch, dim=-1) / 0.03
-        sim_clean = torch.sum(adv_feat * clean_feat, dim=-1)
+        target_labels = torch.full(
+            (B,),
+            target_index,
+            dtype=torch.long,
+            device=device
+        )
 
-        # -----------------------
-        # LOSSES
-        # -----------------------
-        loss_target = -sim_target.mean()
-        loss_away = sim_clean.mean()
+        loss_target = F.cross_entropy(logits, target_labels)
+
+        # LDis
+        sim_clean = F.cosine_similarity(adv_feat, clean_feat, dim=-1)
+        loss_dis = sim_clean.mean()
+
         loss_reg = torch.mean(delta ** 2)
 
-        loss = loss_target + 0.5 * loss_away + args.alpha * loss_reg
+        loss = loss_target + 0.5 * loss_dis + args.alpha * loss_reg
 
-        # -----------------------
+        # =========================
         # BACKPROP
-        # -----------------------
+        # =========================
         optimizer.zero_grad()
         loss.backward()
-
         torch.nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
-
         optimizer.step()
 
         total_loss += loss.item()
 
-    avg_loss = total_loss / len(train_loader)
+    avg_loss = total_loss / len(loader)
 
-    print(f"\nEpoch {epoch} | Loss: {avg_loss:.4f} | Sim: {sim_target.mean().item():.4f}")
+    print(f"\nEpoch {epoch+1} | Loss: {avg_loss:.4f}")
 
-    # -----------------------
-    # SAVE BEST
-    # -----------------------
+    # =========================
+    # SAVE CORRECTLY
+    # =========================
     if avg_loss < best_loss:
         best_loss = avg_loss
-        torch.save(
-            delta.detach(),
-            os.path.join(save_path, "best_targeted_uap.pth")
-        )
-        print("✅ Saved BEST UAP")
 
+        torch.save({
+            "generator": generator.state_dict(),
+            "z": z.detach()
+        }, os.path.join(save_path, "best_targeted_uap.pth"))
 
-print("\n✅ Training Complete")
+        print("✅ Saved BEST GENERATOR")
+
+print("\n🎉 Training Complete!")

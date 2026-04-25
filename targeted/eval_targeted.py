@@ -2,7 +2,6 @@ import argparse
 import os
 import torch
 import torch.nn.functional as F
-import numpy as np
 import json
 from torchvision import transforms
 from PIL import Image
@@ -15,20 +14,16 @@ from utils import load_model
 # =========================
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--config',
-    default='./targeted/configs/Retrieval_flickr_targeted_test.yaml')
-
+parser.add_argument('--config', default='../configs/Retrieval_flickr_test.yaml')
 parser.add_argument('--source_model', default='ALBEF')
 parser.add_argument('--text_encoder', default='bert-base-uncased')
-
-parser.add_argument('--checkpoint',
-    default='./checkpoint/ALBEF/flickr30k.pth')
+parser.add_argument('--checkpoint', default='../checkpoint/ALBEF/flickr30k.pth')
 
 parser.add_argument('--uap_path', required=True)
-
 parser.add_argument('--target_text', required=True)
 
 parser.add_argument('--max_samples', type=int, default=1000)
+parser.add_argument('--eps', type=float, default=12)
 
 args = parser.parse_args()
 
@@ -40,6 +35,7 @@ _yaml = yaml.YAML()
 config = _yaml.load(open(args.config))
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+eps = args.eps / 255.0
 
 
 # =========================
@@ -59,23 +55,34 @@ model.eval()
 
 
 # =========================
-# LOAD UAP
+# LOAD UAP (SAFE)
 # =========================
-uap_noise = torch.load(args.uap_path, map_location=device)
+ckpt = torch.load(args.uap_path, map_location=device)
 
+if isinstance(ckpt, dict) and "generator" in ckpt:
+    raise ValueError("This script expects DELTA. Use generator version if needed.")
+
+uap_noise = ckpt.to(device)
+
+# shape fix
 if uap_noise.dim() == 3:
     uap_noise = uap_noise.unsqueeze(0)
 
-print(f"✅ Loaded UAP from: {args.uap_path}")
+if uap_noise.size(0) != 1:
+    print("⚠️ Fixing non-universal UAP")
+    uap_noise = uap_noise.mean(dim=0, keepdim=True)
+
+# clamp
+uap_noise = torch.clamp(uap_noise, -eps, eps)
+
+print(f"✅ Loaded UAP: {uap_noise.shape}")
 
 
 # =========================
 # TRANSFORMS
 # =========================
 transform = transforms.Compose([
-    transforms.Resize(
-        (config['image_res'], config['image_res']),
-        interpolation=Image.BICUBIC),
+    transforms.Resize((config['image_res'], config['image_res'])),
     transforms.ToTensor(),
 ])
 
@@ -91,25 +98,25 @@ normalize = transforms.Normalize(
 with open(config['annotation_file'], 'r') as f:
     test_data = json.load(f)
 
-all_texts = []
-all_image_paths = []
-
-for item in test_data:
-    all_texts.extend(item['caption'])
-    all_image_paths.append(
-        os.path.join(config['image_root'], item['image'])
-    )
-
 
 # =========================
-# ENCODE ALL TEXTS
+# BUILD TEXT DATABASE (FIXED)
 # =========================
 print("Encoding all texts...")
 
+all_texts = []
+for item in test_data:
+    caps = item['caption']
+    if not isinstance(caps, list):
+        caps = [caps]
+    all_texts.extend(caps)
+
+batch_size = 64
 all_text_feats = []
 
-for i in range(0, len(all_texts), 64):
-    batch = all_texts[i:i+64]
+for i in range(0, len(all_texts), batch_size):
+
+    batch = all_texts[i:i+batch_size]
 
     with torch.no_grad():
         inp = tokenizer(
@@ -123,28 +130,23 @@ for i in range(0, len(all_texts), 64):
         feat = model.inference_text(inp)['text_feat']
         feat = F.normalize(feat, dim=-1)
 
-        all_text_feats.append(feat.cpu())
+    all_text_feats.append(feat.cpu())
 
-all_text_feats = torch.cat(all_text_feats, dim=0)
+all_text_feats = torch.cat(all_text_feats, dim=0).to(device)
+
+print(f"Total captions: {len(all_texts)}")
 
 
 # =========================
-# TARGET TEXT INDEX
+# TARGET INDEX
 # =========================
 with torch.no_grad():
-    target_input = tokenizer(
-        [args.target_text],
-        padding='max_length',
-        truncation=True,
-        max_length=30,
-        return_tensors='pt'
-    ).to(device)
+    target_input = tokenizer([args.target_text], return_tensors='pt').to(device)
 
-    target_txt_feat = model.inference_text(target_input)['text_feat']
-    target_txt_feat = F.normalize(target_txt_feat, dim=-1).cpu()
+    target_feat = model.inference_text(target_input)['text_feat']
+    target_feat = F.normalize(target_feat, dim=-1)
 
-target_sim = (target_txt_feat @ all_text_feats.T).squeeze()
-target_idx = target_sim.argmax().item()
+target_idx = (target_feat @ all_text_feats.T).argmax().item()
 
 print(f"\n🎯 Target: {args.target_text}")
 print(f"Closest DB text: {all_texts[target_idx]}")
@@ -153,82 +155,87 @@ print(f"Closest DB text: {all_texts[target_idx]}")
 # =========================
 # EVALUATION
 # =========================
-print("\nEvaluating Targeted Attack...")
+print("\nEvaluating...")
 
 total = 0
-untargeted_success = 0
-targeted_success = 0
+untargeted = 0
+targeted_r1 = 0
+targeted_r5 = 0
+targeted_r10 = 0
 
 caption_ptr = 0
 
-for idx, item in enumerate(test_data[:args.max_samples]):
+for item in test_data[:args.max_samples]:
+
+    captions = item['caption']
+    if not isinstance(captions, list):
+        captions = [captions]
+
+    num_caps = len(captions)
 
     img_path = os.path.join(config['image_root'], item['image'])
 
     if not os.path.exists(img_path):
-        caption_ptr += len(item['caption'])
+        caption_ptr += num_caps
         continue
 
-    image = transform(Image.open(img_path).convert('RGB'))
-    image = image.unsqueeze(0).to(device)
+    image = transform(Image.open(img_path).convert('RGB')).unsqueeze(0).to(device)
 
     with torch.no_grad():
 
-        # Clean
-        clean_feat = model.inference_image(
-            normalize(image)
-        )['image_feat']
+        clean_feat = model.inference_image(normalize(image))['image_feat']
+        clean_feat = F.normalize(clean_feat, dim=-1)
 
-        # Adversarial
-        adv_image = torch.clamp(image + uap_noise, 0, 1)
+        delta = F.interpolate(uap_noise, size=image.shape[-2:], mode='bilinear')
 
-        adv_feat = model.inference_image(
-            normalize(adv_image)
-        )['image_feat']
+        adv_image = torch.clamp(image + delta, 0, 1)
 
-    # Normalize
-    clean_feat = F.normalize(clean_feat, dim=-1).cpu()
-    adv_feat = F.normalize(adv_feat, dim=-1).cpu()
+        adv_feat = model.inference_image(normalize(adv_image))['image_feat']
+        adv_feat = F.normalize(adv_feat, dim=-1)
 
-    # Similarity
     clean_sim = (clean_feat @ all_text_feats.T).squeeze()
     adv_sim = (adv_feat @ all_text_feats.T).squeeze()
 
     clean_top = clean_sim.argmax().item()
+
+    gt_range = list(range(caption_ptr, caption_ptr + num_caps))
+    caption_ptr += num_caps
+
+    if clean_top not in gt_range:
+        continue
+
+    total += 1
+
     adv_top = adv_sim.argmax().item()
 
-    # Ground truth indices
-    gt_indices = list(range(
-        caption_ptr,
-        caption_ptr + len(item['caption'])
-    ))
+    if adv_top not in gt_range:
+        untargeted += 1
 
-    caption_ptr += len(item['caption'])
+    # R@1
+    if adv_top == target_idx:
+        targeted_r1 += 1
 
-    # Only evaluate correct clean retrieval
-    if clean_top in gt_indices:
+    # R@5
+    if target_idx in adv_sim.topk(5).indices:
+        targeted_r5 += 1
 
-        total += 1
-
-        # Untargeted success
-        if adv_top not in gt_indices:
-            untargeted_success += 1
-
-        # Targeted success
-        if adv_top == target_idx:
-            targeted_success += 1
+    # R@10
+    if target_idx in adv_sim.topk(10).indices:
+        targeted_r10 += 1
 
 
 # =========================
 # RESULTS
 # =========================
 print("\n" + "="*60)
-print("TARGETED ATTACK RESULTS")
+print("RESULTS")
 print("="*60)
 
-print(f"Total valid samples: {total}")
+print(f"Total samples: {total}")
 
-print(f"\nUntargeted ASR: {100 * untargeted_success / max(total,1):.2f}%")
-print(f"Targeted ASR:   {100 * targeted_success / max(total,1):.2f}%")
+print(f"\nUntargeted ASR: {100*untargeted/max(total,1):.2f}%")
+print(f"Targeted R@1:   {100*targeted_r1/max(total,1):.2f}%")
+print(f"Targeted R@5:   {100*targeted_r5/max(total,1):.2f}%")
+print(f"Targeted R@10:  {100*targeted_r10/max(total,1):.2f}%")
 
 print("="*60)

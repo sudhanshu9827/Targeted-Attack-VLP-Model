@@ -26,6 +26,9 @@ class Generator(nn.Module):
         self.length = len(num_filters)
         self.hidden_layer = nn.ModuleList()
 
+        # ✅ store context dim for validation
+        self.context_dim = context_dim
+
         # =========================
         # BUILD NETWORK
         # =========================
@@ -34,6 +37,7 @@ class Generator(nn.Module):
 
             for j in range(len(num_filters[i])):
 
+                # 🔹 FIRST BLOCK FIRST LAYER (no upsample)
                 if (i == 0) and (j == 0):
                     layers.append(
                         nn.ConvTranspose2d(
@@ -44,33 +48,39 @@ class Generator(nn.Module):
                             padding=0
                         )
                     )
+
+                # 🔹 FIRST LAYER OF EACH BLOCK → UPSAMPLE
                 elif j == 0:
                     layers.append(
                         nn.ConvTranspose2d(
                             num_filters[i-1][-1],
                             num_filters[i][j],
                             kernel_size=4,
-                            stride=2,
+                            stride=2,   # ✅ upsample ONLY here
                             padding=1
                         )
                     )
+
+                # 🔹 INNER LAYERS → REFINE (NO UPSAMPLE)
                 else:
                     layers.append(
                         nn.ConvTranspose2d(
                             num_filters[i][j-1],
                             num_filters[i][j],
-                            kernel_size=4,
-                            stride=2,
+                            kernel_size=3,
+                            stride=1,   # ✅ FIXED
                             padding=1
                         )
                     )
-
+#LeakyReLU improves gradient flow in deeper layers
                 layers.append(nn.BatchNorm2d(num_filters[i][j]))
-                layers.append(nn.ReLU(True))
+                layers.append(nn.LeakyReLU(0.2, inplace=True))
 
             self.hidden_layer.append(nn.Sequential(*layers))
 
-            # Cross attention
+            # =========================
+            # CROSS ATTENTION
+            # =========================
             if i < len(num_filters) - 1:
                 self.hidden_layer.append(
                     SpatialTransformer(
@@ -93,20 +103,29 @@ class Generator(nn.Module):
                 stride=2,
                 padding=1
             ),
-            nn.Tanh()   # keep but we scale later
+            nn.Tanh()
         )
 
     def forward(self, x, cond):
         """
-        x: (B, z_dim, 1, 1)
+        x: (B, z_dim, H, W)
         cond: (B, D)
         """
 
-        text_cond = cond.unsqueeze(1)  # (B,1,D)
+        # =========================
+        # VALIDATION (IMPORTANT)
+        # =========================
+        assert cond.shape[-1] == self.context_dim, \
+            f"cond dim {cond.shape[-1]} != context_dim {self.context_dim}"
 
+        text_cond = cond.unsqueeze(1)  # (B, 1, D)
+
+        # =========================
+        # FORWARD
+        # =========================
         for i in range(self.length - 1):
-            x = self.hidden_layer[2*i](x)
-            x = self.hidden_layer[2*i + 1](x, text_cond)
+            x = self.hidden_layer[2*i](x)                # conv block
+            x = self.hidden_layer[2*i + 1](x, text_cond) # attention
 
         x = self.hidden_layer[2 * (self.length - 1)](x)
 
