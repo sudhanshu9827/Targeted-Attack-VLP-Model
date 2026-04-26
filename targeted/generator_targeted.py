@@ -56,7 +56,7 @@ class Generator(nn.Module):
                             num_filters[i-1][-1],
                             num_filters[i][j],
                             kernel_size=4,
-                            stride=2,   # ✅ upsample ONLY here
+                            stride=2,   
                             padding=1
                         )
                     )
@@ -68,7 +68,7 @@ class Generator(nn.Module):
                             num_filters[i][j-1],
                             num_filters[i][j],
                             kernel_size=3,
-                            stride=1,   # ✅ FIXED
+                            stride=1,   
                             padding=1
                         )
                     )
@@ -81,6 +81,8 @@ class Generator(nn.Module):
             # =========================
             # CROSS ATTENTION
             # =========================
+            #  a SpatialTransformer — that injects the source text embedding into the generation process.
+            #  This is what makes the perturbation semantically informed rather than random noise."
             if i < len(num_filters) - 1:
                 self.hidden_layer.append(
                     SpatialTransformer(

@@ -6,7 +6,9 @@ import json
 from torchvision import transforms
 from PIL import Image
 import ruamel.yaml as yaml
+
 from utils import load_model
+from generator_targeted import Generator
 
 
 # =========================
@@ -23,7 +25,7 @@ parser.add_argument('--uap_path', required=True)
 parser.add_argument('--target_text', required=True)
 
 parser.add_argument('--max_samples', type=int, default=1000)
-parser.add_argument('--eps', type=float, default=12)
+parser.add_argument('--eps', type=float, default=20)
 
 args = parser.parse_args()
 
@@ -42,6 +44,7 @@ eps = args.eps / 255.0
 # LOAD MODEL
 # =========================
 print("Loading model...")
+
 model, _, tokenizer = load_model(
     args.source_model,
     args.checkpoint,
@@ -52,30 +55,6 @@ model, _, tokenizer = load_model(
 
 model = model.to(device)
 model.eval()
-
-
-# =========================
-# LOAD UAP (SAFE)
-# =========================
-ckpt = torch.load(args.uap_path, map_location=device)
-
-if isinstance(ckpt, dict) and "generator" in ckpt:
-    raise ValueError("This script expects DELTA. Use generator version if needed.")
-
-uap_noise = ckpt.to(device)
-
-# shape fix
-if uap_noise.dim() == 3:
-    uap_noise = uap_noise.unsqueeze(0)
-
-if uap_noise.size(0) != 1:
-    print("⚠️ Fixing non-universal UAP")
-    uap_noise = uap_noise.mean(dim=0, keepdim=True)
-
-# clamp
-uap_noise = torch.clamp(uap_noise, -eps, eps)
-
-print(f"✅ Loaded UAP: {uap_noise.shape}")
 
 
 # =========================
@@ -100,7 +79,7 @@ with open(config['annotation_file'], 'r') as f:
 
 
 # =========================
-# BUILD TEXT DATABASE (FIXED)
+# BUILD TEXT DATABASE
 # =========================
 print("Encoding all texts...")
 
@@ -115,7 +94,6 @@ batch_size = 64
 all_text_feats = []
 
 for i in range(0, len(all_texts), batch_size):
-
     batch = all_texts[i:i+batch_size]
 
     with torch.no_grad():
@@ -138,18 +116,71 @@ print(f"Total captions: {len(all_texts)}")
 
 
 # =========================
-# TARGET INDEX
+# TARGET TEXT
 # =========================
 with torch.no_grad():
-    target_input = tokenizer([args.target_text], return_tensors='pt').to(device)
+    target_input = tokenizer(
+        [args.target_text],
+        padding='max_length',
+        truncation=True,
+        max_length=30,
+        return_tensors='pt'
+    ).to(device)
 
-    target_feat = model.inference_text(target_input)['text_feat']
-    target_feat = F.normalize(target_feat, dim=-1)
+    target_txt_feat = model.inference_text(target_input)['text_feat']
+    target_txt_feat = F.normalize(target_txt_feat, dim=-1)
 
-target_idx = (target_feat @ all_text_feats.T).argmax().item()
+target_idx = (target_txt_feat @ all_text_feats.T).argmax().item()
 
 print(f"\n🎯 Target: {args.target_text}")
 print(f"Closest DB text: {all_texts[target_idx]}")
+
+
+# =========================
+# LOAD UAP (FIXED)
+# =========================
+print("\nLoading UAP...")
+
+ckpt = torch.load(args.uap_path, map_location=device)
+
+# 🔥 CASE 1: Generator checkpoint (your current setup)
+if isinstance(ckpt, dict) and "generator" in ckpt:
+
+    print("✅ Using generator-based UAP")
+
+    generator = Generator(
+        input_dim=100,
+        num_filters=[[512,256],[128,64],[32,16]],
+        output_dim=3,
+        batch_size=1,
+        first_kernel_size=4,
+        context_dim=target_txt_feat.shape[-1]
+    ).to(device)
+
+    generator.load_state_dict(ckpt["generator"])
+    generator.eval()
+
+    z = ckpt["z"].to(device)
+
+    with torch.no_grad():
+        uap_noise = generator(z, target_txt_feat)
+
+# 🔥 CASE 2: Raw delta (fallback)
+else:
+    print("⚠️ Using raw delta UAP")
+
+    uap_noise = ckpt.to(device)
+
+    if uap_noise.dim() == 3:
+        uap_noise = uap_noise.unsqueeze(0)
+
+    if uap_noise.size(0) != 1:
+        uap_noise = uap_noise.mean(dim=0, keepdim=True)
+
+# Clamp
+uap_noise = torch.clamp(uap_noise, -eps, eps)
+
+print(f"UAP shape: {uap_noise.shape}")
 
 
 # =========================
@@ -211,15 +242,12 @@ for item in test_data[:args.max_samples]:
     if adv_top not in gt_range:
         untargeted += 1
 
-    # R@1
     if adv_top == target_idx:
         targeted_r1 += 1
 
-    # R@5
     if target_idx in adv_sim.topk(5).indices:
         targeted_r5 += 1
 
-    # R@10
     if target_idx in adv_sim.topk(10).indices:
         targeted_r10 += 1
 
